@@ -5,12 +5,13 @@ pub use self::state::{MemoryStackState, MemoryStackSubstate, StackState};
 use crate::gasometer::{self, Gasometer};
 use crate::{
     Capture, Config, Context, CreateScheme, ExitError, ExitReason, ExitSucceed, Handler, Opcode,
-    Runtime, Stack, Transfer,
+    Runtime, RuntimeStep, Stack, Transfer,
 };
 use alloc::{rc::Rc, vec::Vec};
 use core::{cmp::min, convert::Infallible};
 use primitive_types::{H160, H256, U256};
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
 
 pub enum StackExitKind {
     Succeeded,
@@ -66,6 +67,7 @@ impl<'config> StackSubstateMetadata<'config> {
 /// Stack-based executor.
 pub struct StackExecutor<'config, 'precompile, S> {
     config: &'config Config,
+    #[allow(clippy::type_complexity)]
     precompile: Option<
         &'precompile mut dyn FnMut(
             H160,
@@ -76,6 +78,17 @@ pub struct StackExecutor<'config, 'precompile, S> {
             -> Option<Result<(ExitSucceed, Vec<u8>, u64), ExitError>>,
     >,
     state: S,
+    pub steps: Vec<Step>,
+}
+
+pub type Gas = u64;
+
+pub struct Step {
+    pub depth: usize,
+    pub gas: Gas,
+    pub gas_cost: Gas,
+    pub runtime_step: RuntimeStep, // TODO: inline
+    pub storage: HashMap<H256, H256>,
 }
 
 impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'precompile, S> {
@@ -85,9 +98,12 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             config,
             precompile: None,
             state,
+            steps: vec![],
         }
     }
+
     /// Create a new stack-based executor with given precompiles.
+    #[allow(clippy::type_complexity)]
     pub fn new_with_precompile(
         state: S,
         config: &'config Config,
@@ -104,6 +120,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             config,
             precompile: Some(precompile),
             state,
+            steps: vec![],
         }
     }
 
@@ -342,14 +359,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
         }
 
         let after_gas = if take_l64 && self.config.call_l64_after_gas {
-            if self.config.estimate {
-                let initial_after_gas = self.state.metadata().gasometer.gas();
-                let diff = initial_after_gas - l64(initial_after_gas);
-                try_or_fail!(self.state.metadata_mut().gasometer.record_cost(diff));
-                self.state.metadata().gasometer.gas()
-            } else {
-                l64(self.state.metadata().gasometer.gas())
-            }
+            l64(self.state.metadata().gasometer.gas())
         } else {
             self.state.metadata().gasometer.gas()
         };
@@ -465,6 +475,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn call_inner(
         &mut self,
         code_address: H160,
@@ -490,14 +501,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
         }
 
         let after_gas = if take_l64 && self.config.call_l64_after_gas {
-            if self.config.estimate {
-                let initial_after_gas = self.state.metadata().gasometer.gas();
-                let diff = initial_after_gas - l64(initial_after_gas);
-                try_or_fail!(self.state.metadata_mut().gasometer.record_cost(diff));
-                self.state.metadata().gasometer.gas()
-            } else {
-                l64(self.state.metadata().gasometer.gas())
-            }
+            l64(self.state.metadata().gasometer.gas())
         } else {
             self.state.metadata().gasometer.gas()
         };
@@ -677,7 +681,7 @@ impl<'config, 'precompile, S: StackState<'config>> Handler
 
         self.state.transfer(Transfer {
             source: address,
-            target: target,
+            target,
             value: balance,
         })?;
         self.state.reset_balance(address);
@@ -746,5 +750,21 @@ impl<'config, 'precompile, S: StackState<'config>> Handler
         }
 
         Ok(())
+    }
+
+    fn register_step(&mut self, runtime_step: RuntimeStep) {
+        let depth = self.state.metadata().depth.as_ref().copied().unwrap_or(0);
+        let gas = self.used_gas();
+        let gas_cost = gas - self.steps.last().map(|step| step.gas).unwrap_or(0);
+        let storage = self.state.storage_map(runtime_step.address);
+
+        let step = Step {
+            depth,
+            gas,
+            gas_cost,
+            runtime_step,
+            storage,
+        };
+        self.steps.push(step);
     }
 }
