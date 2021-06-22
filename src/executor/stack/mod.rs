@@ -4,13 +4,16 @@ pub use self::state::{MemoryStackState, MemoryStackSubstate, StackState};
 
 use crate::gasometer::{self, Gasometer};
 use crate::{
-    Capture, Config, Context, CreateScheme, ExitError, ExitReason, ExitSucceed, Handler, Opcode,
-    Runtime, Stack, Transfer,
+    executor::traces, Capture, Config, Context, CreateScheme, ExitError, ExitReason, ExitSucceed,
+    Handler, Opcode, Runtime, Stack, Transfer,
 };
 use alloc::{rc::Rc, vec::Vec};
 use core::{cmp::min, convert::Infallible};
+use evm_runtime::CallScheme;
 use primitive_types::{H160, H256, U256};
 use sha3::{Digest, Keccak256};
+
+use super::traces::Trace;
 
 pub enum StackExitKind {
     Succeeded,
@@ -76,6 +79,7 @@ pub struct StackExecutor<'config, 'precompile, S> {
             -> Option<Result<(ExitSucceed, Vec<u8>, u64), ExitError>>,
     >,
     state: S,
+    tracer: traces::TraceTracker,
 }
 
 impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'precompile, S> {
@@ -85,6 +89,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             config,
             precompile: None,
             state,
+            tracer: traces::TraceTracker::new(),
         }
     }
     /// Create a new stack-based executor with given precompiles.
@@ -104,7 +109,11 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             config,
             precompile: Some(precompile),
             state,
+            tracer: traces::TraceTracker::new(),
         }
+    }
+    pub fn take_traces(&mut self) -> Vec<Trace> {
+        self.tracer.take_traces()
     }
 
     pub fn state(&self) -> &S {
@@ -253,7 +262,7 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             }),
             data,
             Some(gas_limit),
-            false,
+            None,
             false,
             false,
             context,
@@ -308,8 +317,38 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
             CreateScheme::Fixed(naddress) => naddress,
         }
     }
-
     fn create_inner(
+        &mut self,
+        caller: H160,
+        scheme: CreateScheme,
+        value: U256,
+        init_code: Vec<u8>,
+        target_gas: Option<u64>,
+        take_l64: bool,
+    ) -> Capture<(ExitReason, Option<H160>, Vec<u8>), Infallible> {
+        let gas_before = self.gas_left();
+        self.tracer
+            .start_create(caller, value, gas_before, init_code.clone(), scheme.clone());
+        match self._create_inner(caller, scheme, value, init_code, target_gas, take_l64) {
+            Capture::Exit((reason, contract, output)) => {
+                let output = if let Some(address) = contract {
+                    self.state.code(address)
+                } else {
+                    output
+                };
+                self.tracer.end_subroutine(
+                    gas_before.saturating_sub(self.gas_left()),
+                    contract,
+                    output.clone(),
+                    reason.clone(),
+                );
+                Capture::Exit((reason, contract, output))
+            }
+            Capture::Trap(_) => unreachable!(),
+        }
+    }
+
+    fn _create_inner(
         &mut self,
         caller: H160,
         scheme: CreateScheme,
@@ -466,6 +505,48 @@ impl<'config, 'precompile, S: StackState<'config>> StackExecutor<'config, 'preco
     }
 
     fn call_inner(
+        &mut self,
+        code_address: H160,
+        transfer: Option<Transfer>,
+        input: Vec<u8>,
+        target_gas: Option<u64>,
+        call_scheme: Option<CallScheme>,
+        take_l64: bool,
+        take_stipend: bool,
+        context: Context,
+    ) -> Capture<(ExitReason, Vec<u8>), Infallible> {
+        let gas_before = self.gas_left();
+        self.tracer.start_call(
+            code_address,
+            context.clone(),
+            gas_before,
+            input.clone(),
+            call_scheme,
+        );
+        match self._call_inner(
+            code_address,
+            transfer,
+            input,
+            target_gas,
+            call_scheme.map_or(false, |c| c == CallScheme::StaticCall),
+            take_l64,
+            take_stipend,
+            context,
+        ) {
+            Capture::Exit((reason, output)) => {
+                self.tracer.end_subroutine(
+                    gas_before.saturating_sub(self.gas_left()),
+                    None,
+                    output.clone(),
+                    reason.clone(),
+                );
+                Capture::Exit((reason, output))
+            }
+            Capture::Trap(_) => unreachable!(),
+        }
+    }
+
+    fn _call_inner(
         &mut self,
         code_address: H160,
         transfer: Option<Transfer>,
@@ -703,7 +784,7 @@ impl<'config, 'precompile, S: StackState<'config>> Handler
         transfer: Option<Transfer>,
         input: Vec<u8>,
         target_gas: Option<u64>,
-        is_static: bool,
+        call_scheme: CallScheme,
         context: Context,
     ) -> Capture<(ExitReason, Vec<u8>), Self::CallInterrupt> {
         self.call_inner(
@@ -711,7 +792,7 @@ impl<'config, 'precompile, S: StackState<'config>> Handler
             transfer,
             input,
             target_gas,
-            is_static,
+            Some(call_scheme),
             true,
             true,
             context,
